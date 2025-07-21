@@ -31,6 +31,9 @@ def test_db_connection(request):
 
 @api.post("/assign-staff")
 def assign_staff(request):
+    import psycopg2
+    import os
+
     conn = psycopg2.connect(
         dbname="postgres",
         user=os.environ["DB_USER"],
@@ -40,7 +43,13 @@ def assign_staff(request):
     )
     cur = conn.cursor()
 
-    # 找出待指派（Pending）任務
+    # skill to user department 映射表（可擴充）
+    skill_to_dept = {
+        "nurse": "Nurse",
+        "transporter": "Delivery Dept."
+    }
+
+    # 1. 找出 Pending 任務
     cur.execute("""
         SELECT id, skill
         FROM patient_rq
@@ -48,7 +57,7 @@ def assign_staff(request):
     """)
     requests = cur.fetchall()
 
-    # 找出可用人員（不是已派送任務中、且是 Nurse 或 Delivery Dept.）
+    # 2. 找出可用人員（未指派中、符合部門）
     cur.execute("""
         SELECT id, "UserDept"
         FROM "User"
@@ -56,28 +65,33 @@ def assign_staff(request):
           AND id NOT IN (
               SELECT assigned_user_id
               FROM patient_rq
-              WHERE status IN ('Start', 'Scheduling') AND assigned_user_id IS NOT NULL
+              WHERE status IN ('Start', 'Scheduling')
+                AND assigned_user_id IS NOT NULL
           )
     """)
     users = cur.fetchall()
 
     assigned = []
-    for req_id, skill_needed in requests:
+    for req_id, skill in requests:
+        expected_dept = skill_to_dept.get(skill.lower())  # skill 可能是 lowercase
+        if not expected_dept:
+            continue  # 無對應的部門，跳過
+
         for i, (user_id, user_dept) in enumerate(users):
-            if (skill_needed == 'Nurse' and user_dept == 'Nurse') or \
-               (skill_needed == 'Delivery Dept.' and user_dept == 'Delivery Dept.'):
+            if user_dept == expected_dept:
                 cur.execute("""
                     UPDATE patient_rq
                     SET assigned_user_id = %s, status = 'Scheduling'
                     WHERE id = %s
                 """, (user_id, req_id))
                 assigned.append({ "rq_id": req_id, "user_id": user_id })
-                users.pop(i)  # 移除已使用的 user
+                users.pop(i)  # 避免同一個人被重複使用
                 break
 
     conn.commit()
     cur.close()
     conn.close()
+
     return {"assigned": assigned, "count": len(assigned)}
 
 
