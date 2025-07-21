@@ -74,7 +74,7 @@ def assign_fleets(request):
                 # assign fleet
                 cur.execute("""
                     UPDATE patient_rq
-                    SET assigned_fleet_id = %s, status = 'Start'
+                    SET assigned_fleet_id = %s, status = 'Scheduling'
                     WHERE id = %s
                 """, (fleet_id, req_id))
                 assigned.append({
