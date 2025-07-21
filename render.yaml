@@ -1,0 +1,10 @@
+# render.yaml
+services:
+  - type: web
+    name: mediflow
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn mediflow.wsgi:application
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: mediflow.settings
