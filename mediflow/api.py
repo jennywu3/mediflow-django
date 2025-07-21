@@ -31,8 +31,9 @@ def test_db_connection(request):
 
 @api.post("/assign-fleets")
 def assign_fleets(request):
+    import os
+    import psycopg2
 
-    # 如果用 Supabase，要連線資料庫
     conn = psycopg2.connect(
         dbname="postgres",
         user=os.environ["DB_USER"],
@@ -42,7 +43,7 @@ def assign_fleets(request):
     )
     cur = conn.cursor()
 
-    # 1. 找出 pending request
+    # 1. 找出所有 Pending requests
     cur.execute("""
         SELECT id, origin, destination, skill
         FROM patient_rq
@@ -50,39 +51,40 @@ def assign_fleets(request):
     """)
     requests = cur.fetchall()
 
-    # 2. 找出 available fleet
-    cur.execute("""
-        SELECT id, skill
-        FROM patient_fleet
-        WHERE id NOT IN (
-            SELECT assigned_fleet_id
-            FROM patient_rq
-            WHERE status = 'Start'
-            AND assigned_fleet_id IS NOT NULL
-        )
-    """)
-    fleets = cur.fetchall()
-
     assigned = []
     for req in requests:
         req_id, origin, dest, skill_needed = req
 
-        for i, fleet in enumerate(fleets):
-            fleet_id, fleet_skill = fleet
+        # 2. 動態查找這筆 request 最適合的 fleet
+        cur.execute("""
+            SELECT id
+            FROM patient_fleet
+            WHERE skill = %s
+              AND id NOT IN (
+                  SELECT assigned_fleet_id
+                  FROM patient_rq
+                  WHERE status IN ('Start', 'Scheduling')
+                    AND assigned_fleet_id IS NOT NULL
+              )
+            ORDER BY cost ASC, available_time ASC
+            LIMIT 1
+        """, (skill_needed,))
+        result = cur.fetchone()
 
-            if fleet_skill == skill_needed:
-                # assign fleet
-                cur.execute("""
-                    UPDATE patient_rq
-                    SET assigned_fleet_id = %s, status = 'Scheduling'
-                    WHERE id = %s
-                """, (fleet_id, req_id))
-                assigned.append({
-                    "request_id": req_id,
-                    "fleet_id": fleet_id
-                })
-                fleets.pop(i)  # remove from available
-                break
+        if result:
+            fleet_id = result[0]
+
+            # 3. 指派 fleet，並設為 Scheduling
+            cur.execute("""
+                UPDATE patient_rq
+                SET assigned_fleet_id = %s, status = 'Scheduling'
+                WHERE id = %s
+            """, (fleet_id, req_id))
+
+            assigned.append({
+                "request_id": req_id,
+                "fleet_id": fleet_id
+            })
 
     conn.commit()
     cur.close()
