@@ -29,6 +29,57 @@ def test_db_connection(request):
         return {"success": False, "error": str(e)}
 
 
+@api.post("/assign-staff")
+def assign_staff(request):
+    conn = psycopg2.connect(
+        dbname="postgres",
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        host=os.environ["DB_HOST"],
+        port="5432"
+    )
+    cur = conn.cursor()
+
+    # 找出 Pending 任務
+    cur.execute("""
+        SELECT id, skill FROM patient_rq
+        WHERE status = 'Pending'
+    """)
+    requests = cur.fetchall()
+
+    # 找出可用人員（未指派中）
+    cur.execute("""
+        SELECT id, skill FROM delivery_user
+        WHERE id NOT IN (
+            SELECT assigned_user_id
+            FROM patient_rq
+            WHERE status = 'Start'
+        )
+    """)
+    users = cur.fetchall()
+
+    assigned = []
+    for req in requests:
+        req_id, skill_needed = req
+
+        for i, user in enumerate(users):
+            user_id, user_skill = user
+            if user_skill == skill_needed:
+                cur.execute("""
+                    UPDATE patient_rq
+                    SET assigned_user_id = %s, status = 'Scheduling'
+                    WHERE id = %s
+                """, (user_id, req_id))
+                assigned.append({ "rq_id": req_id, "user_id": user_id })
+                users.pop(i)
+                break
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"assigned": assigned}
+
+
 @api.post("/assign-fleets")
 def assign_fleets(request):
     import os
