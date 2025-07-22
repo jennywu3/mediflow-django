@@ -100,6 +100,89 @@ def assign_patient(request):
     return { "assigned": assigned, "count": len(assigned) }
 
 
+
+
+@api.post("/assign-material")
+def assign_material_staff(request):
+
+    conn = psycopg2.connect(
+        dbname="postgres",
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        host=os.environ["DB_HOST"],
+        port="5432"
+    )
+    cur = conn.cursor()
+
+    # 查 inventory map: item -> category
+    cur.execute('SELECT item_name, category FROM "Inventory"')
+    inventory_map = dict(cur.fetchall())
+
+    # 查所有 Pending delivery 任務
+    cur.execute("""
+        SELECT id, "Item", "RequestTime"
+        FROM delivery_status
+        WHERE status = 'Pending'
+    """)
+    pending_tasks = cur.fetchall()
+
+    # 查所有 fleet（AGV + Transporter），依 cost 升冪排序
+    cur.execute("""
+        SELECT id, "userId", type, cost, s_start, s_end
+        FROM patient_fleet
+        ORDER BY cost ASC
+    """)
+    all_fleets = cur.fetchall()
+
+    assigned = []
+
+    for delivery_id, item_name, request_time_str in pending_tasks:
+        # --- Step 1. 判斷類型是否為 Laundry ---
+        category = inventory_map.get(item_name)
+        required_type = 2 if category == "Laundry" else 1
+
+        # --- Step 2. 將時間轉換為分鐘 ---
+        try:
+            dt = datetime.strptime(request_time_str, "%d/%m/%Y, %H:%M:%S")
+            request_min = dt.hour * 60 + dt.minute
+        except Exception as e:
+            continue  # 時間格式錯誤 → 跳過
+
+        # --- Step 3. 搜尋可用 fleet ---
+        for i, (fleet_id, user_id, f_type, cost, s_start, s_end) in enumerate(all_fleets):
+            if f_type != required_type:
+                continue
+            if s_start <= request_min <= s_end:
+                # 可用 → 指派
+                cur.execute("""
+                    UPDATE delivery_status
+                    SET assigned_user_id = %s,
+                        assigned_fleet_id = %s,
+                        status = 'Scheduling'
+                    WHERE id = %s
+                """, (user_id, fleet_id, delivery_id))
+
+                assigned.append({
+                    "delivery_id": delivery_id,
+                    "item": item_name,
+                    "category": category,
+                    "fleet_id": fleet_id,
+                    "user_id": user_id,
+                    "minute": request_min
+                })
+                all_fleets.pop(i)
+                break  # 指派完成，換下一筆任務
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "assigned": assigned,
+        "count": len(assigned)
+    }
+
+
 @api.post("/assign-staff")
 def assign_staff(request):
     import psycopg2
