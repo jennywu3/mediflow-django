@@ -158,7 +158,7 @@ def assign_material_staff(request):
                     UPDATE delivery_status
                     SET assigned_user_id = %s,
                         assigned_fleet_id = %s,
-                        status = 'Scheduling'
+                        "DeliveryStatus" = 'Scheduling'
                     WHERE id = %s
                 """, (user_id, fleet_id, delivery_id))
 
