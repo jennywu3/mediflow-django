@@ -61,11 +61,11 @@ def assign_patient(request):
     for req_id, skill in requests:
         # 2. 找出符合 skill 的 fleet，並時間可用
         cur.execute("""
-            SELECT pf.id AS fleet_id, pf.userId, pf.cost
+            SELECT pf.id AS fleet_id, pf."userId", pf.cost
             FROM patient_fleet pf
             WHERE pf.skill = %s
               AND %s BETWEEN pf.s_start AND pf.s_end
-              AND pf.userId NOT IN (
+              AND pf."userId" NOT IN (
                   SELECT assigned_user_id
                   FROM patient_rq
                   WHERE status IN ('Scheduling', 'Start')
