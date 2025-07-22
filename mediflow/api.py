@@ -33,9 +33,6 @@ def test_db_connection(request):
 
 @api.post("/assign-patient")
 def assign_patient(request):
-    import psycopg2
-    import os
-    from datetime import datetime
 
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
 
@@ -101,10 +98,8 @@ def assign_patient(request):
 
 
 
-
 @api.post("/assign-material")
 def assign_material_staff(request):
-
     conn = psycopg2.connect(
         dbname="postgres",
         user=os.environ["DB_USER"],
@@ -117,6 +112,7 @@ def assign_material_staff(request):
     # 查 inventory map: item -> category
     cur.execute('SELECT "Item", "Category" FROM "Inventory"')
     inventory_map = dict(cur.fetchall())
+    print("[INFO] Inventory map:", inventory_map)
 
     # 查所有 Pending delivery 任務
     cur.execute("""
@@ -125,6 +121,7 @@ def assign_material_staff(request):
         WHERE "DeliveryStatus" = 'Pending'
     """)
     pending_tasks = cur.fetchall()
+    print(f"[INFO] Found {len(pending_tasks)} pending tasks.")
 
     # 查所有 fleet（AGV + Transporter），依 cost 升冪排序
     cur.execute("""
@@ -133,54 +130,66 @@ def assign_material_staff(request):
         ORDER BY cost ASC
     """)
     all_fleets = cur.fetchall()
+    print(f"[INFO] Found {len(all_fleets)} fleets.")
 
     assigned = []
 
     for delivery_id, item_name, request_time_str in pending_tasks:
-        # --- Step 1. 判斷類型是否為 Laundry ---
         category = inventory_map.get(item_name)
         required_type = 2 if category == "Laundry" else 1
 
-        # --- Step 2. 將時間轉換為分鐘 ---
+        print(f"\n[Task] ID={delivery_id}, Item='{item_name}', Category={category}, RequiredType={required_type}")
+
         try:
             dt = datetime.strptime(request_time_str, "%d/%m/%Y, %H:%M:%S")
             request_min = dt.hour * 60 + dt.minute
         except Exception as e:
-            continue  # 時間格式錯誤 → 跳過
+            print(f"[ERROR] Invalid RequestTime '{request_time_str}' for delivery ID {delivery_id}")
+            continue
 
-        # --- Step 3. 搜尋可用 fleet ---
+        print(f"[Time] Request at {request_min} minutes")
+
         for i, (fleet_id, user_id, f_type, cost, s_start, s_end) in enumerate(all_fleets):
+            print(f"  > Checking fleet_id={fleet_id}, type={f_type}, cost={cost}, time={s_start}-{s_end}")
             if f_type != required_type:
                 continue
             if s_start <= request_min <= s_end:
-                # 可用 → 指派
-                cur.execute("""
-                    UPDATE delivery_status
-                    SET assigned_user_id = %s,
-                        assigned_fleet_id = %s,
-                        "DeliveryStatus" = 'Scheduling'
-                    WHERE id = %s
-                """, (user_id, fleet_id, delivery_id))
+                try:
+                    cur.execute("""
+                        UPDATE delivery_status
+                        SET assigned_user_id = %s,
+                            assigned_fleet_id = %s,
+                            "DeliveryStatus" = 'Scheduling'
+                        WHERE id = %s
+                    """, (user_id, fleet_id, delivery_id))
 
-                assigned.append({
-                    "delivery_id": delivery_id,
-                    "item": item_name,
-                    "category": category,
-                    "fleet_id": fleet_id,
-                    "user_id": user_id,
-                    "minute": request_min
-                })
-                all_fleets.pop(i)
-                break  # 指派完成，換下一筆任務
+                    assigned.append({
+                        "delivery_id": delivery_id,
+                        "item": item_name,
+                        "category": category,
+                        "fleet_id": fleet_id,
+                        "user_id": user_id,
+                        "minute": request_min
+                    })
+                    print(f"[ASSIGNED] → Fleet {fleet_id} (User {user_id}) assigned to Delivery {delivery_id}")
+                    all_fleets.pop(i)
+                    break
+                except Exception as e:
+                    print(f"[ERROR] Failed to assign fleet: {e}")
+                    continue
 
     conn.commit()
     cur.close()
     conn.close()
 
+    print(f"\n[SUMMARY] Assigned {len(assigned)} tasks.")
     return {
         "assigned": assigned,
         "count": len(assigned)
     }
+
+
+
 
 
 @api.post("/assign-staff")
