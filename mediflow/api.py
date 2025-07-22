@@ -2,6 +2,7 @@ from ninja import NinjaAPI
 import psycopg2
 import os
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()
 
@@ -27,6 +28,76 @@ def test_db_connection(request):
         return {"success": True, "result": result}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+
+@api.post("/assign-patient")
+def assign_patient(request):
+    import psycopg2
+    import os
+    from datetime import datetime
+
+    now_minutes = datetime.now().hour * 60 + datetime.now().minute
+
+    conn = psycopg2.connect(
+        dbname="postgres",
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        host=os.environ["DB_HOST"],
+        port="5432"
+    )
+    cur = conn.cursor()
+
+    # 1. 找出所有 Pending 任務
+    cur.execute("""
+        SELECT id, skill
+        FROM patient_rq
+        WHERE status = 'Pending'
+    """)
+    requests = cur.fetchall()
+
+    assigned = []
+
+    for req_id, skill in requests:
+        # 2. 找出符合 skill 的 fleet，並時間可用
+        cur.execute("""
+            SELECT pf.id AS fleet_id, pf.userId, pf.cost
+            FROM patient_fleet pf
+            WHERE pf.skill = %s
+              AND %s BETWEEN pf.s_start AND pf.s_end
+              AND pf.userId NOT IN (
+                  SELECT assigned_user_id
+                  FROM patient_rq
+                  WHERE status IN ('Scheduling', 'Start')
+                    AND assigned_user_id IS NOT NULL
+              )
+            ORDER BY pf.cost ASC
+            LIMIT 1
+        """, (skill, now_minutes))
+        row = cur.fetchone()
+
+        if row:
+            fleet_id, user_id, _ = row
+            # 更新任務：同時填 assigned_user_id 和 assigned_fleet_id
+            cur.execute("""
+                UPDATE patient_rq
+                SET assigned_user_id = %s,
+                    assigned_fleet_id = %s,
+                    status = 'Scheduling'
+                WHERE id = %s
+            """, (user_id, fleet_id, req_id))
+
+            assigned.append({
+                "rq_id": req_id,
+                "user_id": user_id,
+                "fleet_id": fleet_id
+            })
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return { "assigned": assigned, "count": len(assigned) }
 
 
 @api.post("/assign-staff")
