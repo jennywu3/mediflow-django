@@ -29,11 +29,14 @@ def test_db_connection(request):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# assign_patient: only assign patient_rq
 @api.post("/assign-patient")
 def assign_patient(request):
+    from datetime import datetime
+    import psycopg2
+    import os
 
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
+
     conn = psycopg2.connect(
         dbname="postgres",
         user=os.environ["DB_USER"],
@@ -43,49 +46,90 @@ def assign_patient(request):
     )
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT id, skill
-        FROM patient_rq
-        WHERE status = 'Pending'
-    """)
-    requests = cur.fetchall()
-
     assigned = []
 
-    for req_id, skill in requests:
+    try:
+        # 1. 找出所有 Pending 任務
         cur.execute("""
-            SELECT pf.id AS fleet_id, pf."userId", pf.cost
-            FROM patient_fleet pf
-            WHERE pf.skill = %s
-              AND %s BETWEEN pf.s_start AND pf.s_end
-              AND pf."userId" NOT IN (
-                  SELECT assigned_user_id FROM patient_rq WHERE status IN ('Scheduling', 'Start')
-                  UNION
-                  SELECT assigned_user_id FROM delivery_status WHERE "DeliveryStatus" IN ('Scheduling', 'Start')
-              )
-            ORDER BY pf.cost ASC
-            LIMIT 1
-        """, (skill, now_minutes))
-        row = cur.fetchone()
+            SELECT id, skill
+            FROM patient_rq
+            WHERE status = 'Pending'
+        """)
+        requests = cur.fetchall()
+        print(f"[INFO] Found {len(requests)} pending patient tasks.")
 
-        if row:
-            fleet_id, user_id, _ = row
-            cur.execute("""
-                UPDATE patient_rq
-                SET assigned_user_id = %s,
-                    assigned_fleet_id = %s,
-                    status = 'Scheduling'
-                WHERE id = %s
-            """, (user_id, fleet_id, req_id))
+        # 2. 預先撈出所有 fleet（依 cost 排序）
+        cur.execute("""
+            SELECT id, "userId", skill, cost, s_start, s_end
+            FROM patient_fleet
+            ORDER BY cost ASC
+        """)
+        all_fleets = cur.fetchall()
+        print(f"[INFO] Found {len(all_fleets)} total fleets.")
 
-            assigned.append({"rq_id": req_id, "user_id": user_id, "fleet_id": fleet_id})
+        for req_id, required_skill in requests:
+            print(f"\n[Task] Patient RQ ID={req_id}, Required Skill={required_skill}")
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"assigned": assigned, "count": len(assigned)}
+            for i, (fleet_id, user_id, skill, cost, s_start, s_end) in enumerate(all_fleets):
+                print(f"  > Checking fleet_id={fleet_id}, skill={skill}, cost={cost}, time={s_start}-{s_end}")
+
+                if skill != required_skill:
+                    print("    ✘ Skill mismatch")
+                    continue
+
+                if s_start is None or s_end is None:
+                    print("    ✘ Invalid working time")
+                    continue
+
+                if not (s_start <= now_minutes <= s_end):
+                    print("    ✘ Not available at current time")
+                    continue
+
+                # 檢查 user 是否在其他任務中
+                cur.execute("""
+                    SELECT 1 FROM patient_rq WHERE assigned_user_id = %s AND status IN ('Scheduling', 'Start')
+                    UNION
+                    SELECT 1 FROM delivery_status WHERE assigned_user_id = %s AND "DeliveryStatus" IN ('Scheduling', 'Start')
+                """, (user_id, user_id))
+
+                if cur.fetchone():
+                    print("    ✘ User already assigned to another task")
+                    continue
+
+                # ✔ Assign 成功
+                cur.execute("""
+                    UPDATE patient_rq
+                    SET assigned_user_id = %s,
+                        assigned_fleet_id = %s,
+                        status = 'Scheduling'
+                    WHERE id = %s
+                """, (user_id, fleet_id, req_id))
+
+                assigned.append({
+                    "rq_id": req_id,
+                    "user_id": user_id,
+                    "fleet_id": fleet_id
+                })
+
+                print(f"[ASSIGNED] → Fleet {fleet_id} (User {user_id}) assigned to Patient RQ {req_id}")
+
+                all_fleets.pop(i)  # 移除已分配的 fleet
+                break  # 一筆任務只指派一個 fleet
+
+        conn.commit()
+        return {"assigned": assigned, "count": len(assigned)}
+
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return {"error": str(e)}
+
+    finally:
+        cur.close()
+        conn.close()
 
 
+
+        
 # assign_material: only assign delivery_status
 @api.post("/assign-material")
 def assign_material(request):
