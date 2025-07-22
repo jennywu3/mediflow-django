@@ -115,14 +115,14 @@ def assign_material_staff(request):
     cur = conn.cursor()
 
     # 查 inventory map: item -> category
-    cur.execute('SELECT item_name, category FROM "Inventory"')
+    cur.execute('SELECT "Item", "Category" FROM "Inventory"')
     inventory_map = dict(cur.fetchall())
 
     # 查所有 Pending delivery 任務
     cur.execute("""
         SELECT id, "Item", "RequestTime"
         FROM delivery_status
-        WHERE status = 'Pending'
+        WHERE "DeliveryStatus" = 'Pending'
     """)
     pending_tasks = cur.fetchall()
 
