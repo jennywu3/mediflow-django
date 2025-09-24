@@ -7,6 +7,7 @@ from datetime import datetime
 load_dotenv()
 
 api = NinjaAPI()
+
 @api.get("/hello")
 def hello(request): 
     return "Hello world --"
@@ -29,12 +30,9 @@ def test_db_connection(request):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+# Assign patient transport tasks
 @api.post("/assign-patient")
 def assign_patient(request):
-    from datetime import datetime
-    import psycopg2
-    import os
-
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
 
     conn = psycopg2.connect(
@@ -49,7 +47,7 @@ def assign_patient(request):
     assigned = []
 
     try:
-        # 1. 找出所有 Pending 任務
+        # 1. Fetch all pending patient requests
         cur.execute("""
             SELECT id, skill
             FROM patient_rq
@@ -58,7 +56,7 @@ def assign_patient(request):
         requests = cur.fetchall()
         print(f"[INFO] Found {len(requests)} pending patient tasks.")
 
-        # 2. 預先撈出所有 fleet（依 cost 排序）
+        # 2. Fetch all fleet records (ordered by cost)
         cur.execute("""
             SELECT id, "userId", skill, cost, s_start, s_end
             FROM patient_fleet
@@ -73,19 +71,22 @@ def assign_patient(request):
             for i, (fleet_id, user_id, skill, cost, s_start, s_end) in enumerate(all_fleets):
                 print(f"  > Checking fleet_id={fleet_id}, skill={skill}, cost={cost}, time={s_start}-{s_end}")
 
+                # Skip if skill does not match
                 if skill != required_skill:
                     print("    ✘ Skill mismatch")
                     continue
 
+                # Skip if working time is invalid
                 if s_start is None or s_end is None:
                     print("    ✘ Invalid working time")
                     continue
 
+                # Skip if not available at the current time
                 if not (s_start <= now_minutes <= s_end):
                     print("    ✘ Not available at current time")
                     continue
 
-                # 檢查 user 是否在其他任務中
+                # Check if user is already assigned to another active task
                 cur.execute("""
                     SELECT 1 FROM patient_rq WHERE assigned_user_id = %s AND status IN ('Scheduling', 'Start')
                     UNION
@@ -96,7 +97,7 @@ def assign_patient(request):
                     print("    ✘ User already assigned to another task")
                     continue
 
-                # ✔ Assign 成功
+                # ✔ Assign task
                 cur.execute("""
                     UPDATE patient_rq
                     SET assigned_user_id = %s,
@@ -113,8 +114,8 @@ def assign_patient(request):
 
                 print(f"[ASSIGNED] → Fleet {fleet_id} (User {user_id}) assigned to Patient RQ {req_id}")
 
-                all_fleets.pop(i)  # 移除已分配的 fleet
-                break  # 一筆任務只指派一個 fleet
+                all_fleets.pop(i)  # Remove assigned fleet
+                break  # One task gets one fleet only
 
         conn.commit()
         return {"assigned": assigned, "count": len(assigned)}
@@ -128,12 +129,9 @@ def assign_patient(request):
         conn.close()
 
 
-
-        
-# assign_material: only assign delivery_status
+# Assign material transport tasks
 @api.post("/assign-material")
 def assign_material(request):
-
     conn = psycopg2.connect(
         dbname="postgres",
         user=os.environ["DB_USER"],
@@ -143,9 +141,11 @@ def assign_material(request):
     )
     cur = conn.cursor()
 
+    # Build inventory mapping: item → category
     cur.execute('SELECT "Item", "Category" FROM "Inventory"')
     inventory_map = dict(cur.fetchall())
 
+    # Fetch pending material delivery requests
     cur.execute("""
         SELECT id, "Item", "RequestTime"
         FROM delivery_status
@@ -153,6 +153,7 @@ def assign_material(request):
     """)
     pending_tasks = cur.fetchall()
 
+    # Fetch all fleet (ordered by cost)
     cur.execute("""
         SELECT id, "userId", type, cost, s_start, s_end
         FROM patient_fleet
@@ -178,6 +179,7 @@ def assign_material(request):
             if not (s_start <= request_min <= s_end):
                 continue
 
+            # Ensure user is not already assigned
             cur.execute("""
                 SELECT 1 FROM patient_rq WHERE assigned_user_id = %s AND status IN ('Scheduling', 'Start')
                 UNION
@@ -186,6 +188,7 @@ def assign_material(request):
             if cur.fetchone():
                 continue
 
+            # ✔ Assign material request
             cur.execute("""
                 UPDATE delivery_status
                 SET assigned_user_id = %s,
@@ -194,8 +197,14 @@ def assign_material(request):
                 WHERE id = %s
             """, (user_id, fleet_id, delivery_id))
 
-            assigned.append({"delivery_id": delivery_id, "item": item_name, "category": category,
-                             "fleet_id": fleet_id, "user_id": user_id, "minute": request_min})
+            assigned.append({
+                "delivery_id": delivery_id,
+                "item": item_name,
+                "category": category,
+                "fleet_id": fleet_id,
+                "user_id": user_id,
+                "minute": request_min
+            })
             all_fleets.pop(i)
             break
 
@@ -205,7 +214,7 @@ def assign_material(request):
     return {"assigned": assigned, "count": len(assigned)}
 
 
-# assign_all: assign both patient and material tasks
+# Assign both patient and material tasks
 @api.post("/assign-all")
 def assign_all(request):
     result1 = assign_patient(request)
