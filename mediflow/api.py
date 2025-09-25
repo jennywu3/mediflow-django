@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from datetime import datetime
 
 load_dotenv()
-
 api = NinjaAPI()
 
 def get_conn():
@@ -32,35 +31,31 @@ def test_db_connection(request):
         return {"success": False, "error": str(e)}
 
 # -----------------------
-# Patient assignment 
+# Patient assignment
 # -----------------------
 @api.post("/assign-patient")
 def assign_patient(request):
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
-
     assigned = []
+
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=extras.DictCursor) as cur:
-                # Pending patient tasks
+                # Pending patient tasks (Priority desc, then id asc)
                 cur.execute("""
                     SELECT id, skill
                     FROM patient_rq
                     WHERE status = 'Pending'
-                    ORDER BY id
+                    ORDER BY "Priority" DESC, id ASC
                 """)
                 requests = cur.fetchall()
-
                 if not requests:
                     return {"assigned": [], "count": 0}
 
-                # Fleets that are:
-                #  - have same skill as some pending request
-                #  - within working window now
-                #  - not already busy (Scheduling/Start) on either table
+                # Fleets available now & not already busy; cheapest first
                 cur.execute("""
-                    SELECT pf.id AS fleet_id,
-                           pf."userId" AS user_id,
+                    SELECT pf.id        AS fleet_id,
+                           pf."userId"  AS user_id,
                            pf.skill,
                            pf.cost
                     FROM patient_fleet pf
@@ -87,11 +82,9 @@ def assign_patient(request):
                     ORDER BY pf.cost ASC
                 """, (now_minutes, now_minutes))
                 fleets = cur.fetchall()
-
                 if not fleets:
                     return {"assigned": [], "count": 0}
 
-                # Build fleets-by-skill (cheapest first)
                 from collections import defaultdict, deque
                 fleets_by_skill = defaultdict(deque)
                 for f in fleets:
@@ -101,28 +94,24 @@ def assign_patient(request):
                 patient_updates = []  # (user_id, fleet_id, rq_id)
 
                 for req in requests:
-                    skill = req["skill"]
-                    dq = fleets_by_skill.get(skill)
+                    dq = fleets_by_skill.get(req["skill"])
                     if not dq:
                         continue
-                    # Get the cheapest available fleet whose user not used
                     while dq:
                         f = dq[0]
                         if f["user_id"] in used_users:
                             dq.popleft()
                             continue
-                        # assign
                         used_users.add(f["user_id"])
                         patient_updates.append((f["user_id"], f["fleet_id"], req["id"]))
                         assigned.append({
                             "rq_id": req["id"],
                             "user_id": f["user_id"],
-                            "fleet_id": f["fleet_id"]
+                            "fleet_id": f["fleet_id"],
                         })
                         dq.popleft()
                         break
 
-                # Batch update
                 if patient_updates:
                     extras.execute_batch(
                         cur,
@@ -134,32 +123,32 @@ def assign_patient(request):
                          WHERE id = %s
                         """,
                         patient_updates,
-                        page_size=200
+                        page_size=200,
                     )
-            # conn commits automatically because of context manager
+
         return {"assigned": assigned, "count": len(assigned)}
     except Exception as e:
         return {"error": str(e)}
 
 # -----------------------
-# Material assignment 
+# Material assignment
 # -----------------------
 @api.post("/assign-material")
 def assign_material(request):
     assigned = []
+
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=extras.DictCursor) as cur:
-                # Pending material tasks with computed request_min 
+                # Pending material tasks, order by Priority desc then id
                 cur.execute("""
                     SELECT d.id,
                            d."Item",
-                           -- parse 'DD/MM/YYYY, HH24:MI:SS' to timestamp then to minutes
-                           EXTRACT(HOUR FROM to_timestamp(d."RequestTime",'DD/MM/YYYY, HH24:MI:SS'))*60
-                           + EXTRACT(MINUTE FROM to_timestamp(d."RequestTime",'DD/MM/YYYY, HH24:MI:SS')) AS request_min
+                           EXTRACT(HOUR   FROM to_timestamp(d."RequestTime",'DD/MM/YYYY, HH24:MI:SS'))*60 +
+                           EXTRACT(MINUTE FROM to_timestamp(d."RequestTime",'DD/MM/YYYY, HH24:MI:SS')) AS request_min
                     FROM delivery_status d
                     WHERE d."DeliveryStatus" = 'Pending'
-                    ORDER BY d.id
+                    ORDER BY d."Priority" DESC, d.id ASC
                 """)
                 pending = cur.fetchall()
                 if not pending:
@@ -169,26 +158,25 @@ def assign_material(request):
                 cur.execute('SELECT "Item","Category" FROM "Inventory"')
                 inv_map = dict(cur.fetchall())
 
-                # Needed types for all pending (1 default, 2 for Laundry)
+                # Fleet type is TEXT in schema -> use string "1"/"2"
                 required_types = set()
                 for row in pending:
                     cat = inv_map.get(row["Item"])
-                    required_types.add(2 if cat == "Laundry" else 1)
+                    required_types.add("2" if cat == "Laundry" else "1")
 
                 if not required_types:
                     return {"assigned": [], "count": 0}
 
-                # Fleets by type, available at the specific request minute is trickier;
-                # we filter only by "free" here, then we check time per assignment quickly.
-                cur.execute(f"""
-                    SELECT pf.id AS fleet_id,
+                # Fetch fleets by required types (text[]), cheapest first
+                cur.execute("""
+                    SELECT pf.id       AS fleet_id,
                            pf."userId" AS user_id,
-                           pf.type,
+                           pf.type,              
                            pf.cost,
                            pf.s_start,
                            pf.s_end
                     FROM patient_fleet pf
-                    WHERE pf.type = ANY(%s)
+                    WHERE pf.type = ANY(%s)            
                       AND pf.s_start IS NOT NULL
                       AND pf.s_end   IS NOT NULL
                       AND NOT EXISTS (
@@ -207,28 +195,27 @@ def assign_material(request):
                 if not fleets:
                     return {"assigned": [], "count": 0}
 
-                # Group fleets by type (cheapest first)
                 from collections import defaultdict, deque
                 fleets_by_type = defaultdict(deque)
                 for f in fleets:
-                    fleets_by_type[int(f["type"])].append(f)
+                    # keep string keys ("1"/"2"), DO NOT cast to int
+                    fleets_by_type[f["type"]].append(f)
 
                 used_users = set()
                 material_updates = []  # (user_id, fleet_id, delivery_id)
 
                 for row in pending:
-                    item = row["Item"]
-                    req_min = int(row["request_min"] or 0)
-                    cat = inv_map.get(item)
-                    rtype = 2 if cat == "Laundry" else 1
-                    dq = fleets_by_type.get(rtype)
+                    item   = row["Item"]
+                    reqmin = int(row["request_min"] or 0)
+                    cat    = inv_map.get(item)
+                    rtype  = "2" if cat == "Laundry" else "1"
+                    dq     = fleets_by_type.get(rtype)
                     if not dq:
                         continue
 
-                    # pick the cheapest fleet that is working at request minute & user not used
                     while dq:
                         f = dq[0]
-                        if (f["user_id"] in used_users) or not (f["s_start"] <= req_min <= f["s_end"]):
+                        if (f["user_id"] in used_users) or not (f["s_start"] <= reqmin <= f["s_end"]):
                             dq.popleft()
                             continue
                         used_users.add(f["user_id"])
@@ -239,12 +226,11 @@ def assign_material(request):
                             "category": cat,
                             "fleet_id": f["fleet_id"],
                             "user_id": f["user_id"],
-                            "minute": req_min
+                            "minute": reqmin,
                         })
                         dq.popleft()
                         break
 
-                # Batch update
                 if material_updates:
                     extras.execute_batch(
                         cur,
@@ -256,8 +242,9 @@ def assign_material(request):
                          WHERE id = %s
                         """,
                         material_updates,
-                        page_size=200
+                        page_size=200,
                     )
+
         return {"assigned": assigned, "count": len(assigned)}
     except Exception as e:
         return {"error": str(e)}
@@ -269,7 +256,6 @@ def assign_material(request):
 def assign_all(request):
     p = assign_patient(request)
     m = assign_material(request)
-
     pc = p.get("count", 0) if isinstance(p, dict) else 0
     mc = m.get("count", 0) if isinstance(m, dict) else 0
     return {"patient": p, "material": m, "total_assigned": pc + mc}
