@@ -1,6 +1,7 @@
 from ninja import NinjaAPI
 import os
 import psycopg2
+import psycopg2.extras as extras
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -169,7 +170,6 @@ def assign_material(request):
                 inv_map = dict(cur.fetchall())
 
                 # Needed types for all pending (1 default, 2 for Laundry)
-                # We’ll load fleets that can serve any of the required types and that are free
                 required_types = set()
                 for row in pending:
                     cat = inv_map.get(row["Item"])
