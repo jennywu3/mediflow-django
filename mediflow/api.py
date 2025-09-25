@@ -1,226 +1,273 @@
 from ninja import NinjaAPI
-import psycopg2
 import os
-from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras as extras
 from datetime import datetime
-
-load_dotenv()
 
 api = NinjaAPI()
 
+def get_conn():
+    return psycopg2.connect(
+        dbname="postgres",
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        host=os.environ["DB_HOST"],
+        port="5432"
+    )
+
 @api.get("/hello")
-def hello(request): 
+def hello(request):
     return "Hello world --"
 
 @api.get("/test-db")
 def test_db_connection(request):
     try:
-        conn = psycopg2.connect(
-            dbname="postgres",
-            user=os.environ["DB_USER"],
-            password=os.environ["DB_PASSWORD"],
-            host=os.environ["DB_HOST"],
-            port="5432"
-        )
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        result = cur.fetchone()
-        conn.close()
-        return {"success": True, "result": result}
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            return {"success": True, "result": cur.fetchone()}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# Assign patient transport tasks
+# -----------------------
+# Patient assignment 
+# -----------------------
 @api.post("/assign-patient")
 def assign_patient(request):
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
 
-    conn = psycopg2.connect(
-        dbname="postgres",
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        host=os.environ["DB_HOST"],
-        port="5432"
-    )
-    cur = conn.cursor()
-
     assigned = []
-
     try:
-        # 1. Fetch all pending patient requests
-        cur.execute("""
-            SELECT id, skill
-            FROM patient_rq
-            WHERE status = 'Pending'
-        """)
-        requests = cur.fetchall()
-        print(f"[INFO] Found {len(requests)} pending patient tasks.")
-
-        # 2. Fetch all fleet records (ordered by cost)
-        cur.execute("""
-            SELECT id, "userId", skill, cost, s_start, s_end
-            FROM patient_fleet
-            ORDER BY cost ASC
-        """)
-        all_fleets = cur.fetchall()
-        print(f"[INFO] Found {len(all_fleets)} total fleets.")
-
-        for req_id, required_skill in requests:
-            print(f"\n[Task] Patient RQ ID={req_id}, Required Skill={required_skill}")
-
-            for i, (fleet_id, user_id, skill, cost, s_start, s_end) in enumerate(all_fleets):
-                print(f"  > Checking fleet_id={fleet_id}, skill={skill}, cost={cost}, time={s_start}-{s_end}")
-
-                # Skip if skill does not match
-                if skill != required_skill:
-                    print("    ✘ Skill mismatch")
-                    continue
-
-                # Skip if working time is invalid
-                if s_start is None or s_end is None:
-                    print("    ✘ Invalid working time")
-                    continue
-
-                # Skip if not available at the current time
-                if not (s_start <= now_minutes <= s_end):
-                    print("    ✘ Not available at current time")
-                    continue
-
-                # Check if user is already assigned to another active task
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.DictCursor) as cur:
+                # Pending patient tasks
                 cur.execute("""
-                    SELECT 1 FROM patient_rq WHERE assigned_user_id = %s AND status IN ('Scheduling', 'Start')
-                    UNION
-                    SELECT 1 FROM delivery_status WHERE assigned_user_id = %s AND "DeliveryStatus" IN ('Scheduling', 'Start')
-                """, (user_id, user_id))
+                    SELECT id, skill
+                    FROM patient_rq
+                    WHERE status = 'Pending'
+                    ORDER BY id
+                """)
+                requests = cur.fetchall()
 
-                if cur.fetchone():
-                    print("    ✘ User already assigned to another task")
-                    continue
+                if not requests:
+                    return {"assigned": [], "count": 0}
 
-                # ✔ Assign task
+                # Fleets that are:
+                #  - have same skill as some pending request
+                #  - within working window now
+                #  - not already busy (Scheduling/Start) on either table
                 cur.execute("""
-                    UPDATE patient_rq
-                    SET assigned_user_id = %s,
-                        assigned_fleet_id = %s,
-                        status = 'Scheduling'
-                    WHERE id = %s
-                """, (user_id, fleet_id, req_id))
+                    SELECT pf.id AS fleet_id,
+                           pf."userId" AS user_id,
+                           pf.skill,
+                           pf.cost
+                    FROM patient_fleet pf
+                    WHERE pf.s_start IS NOT NULL
+                      AND pf.s_end   IS NOT NULL
+                      AND pf.s_start <= %s
+                      AND %s <= pf.s_end
+                      AND EXISTS (
+                           SELECT 1
+                           FROM patient_rq pr
+                           WHERE pr.status = 'Pending'
+                             AND pr.skill  = pf.skill
+                      )
+                      AND NOT EXISTS (
+                           SELECT 1 FROM patient_rq x
+                           WHERE x.assigned_user_id = pf."userId"
+                             AND x.status IN ('Scheduling','Start')
+                      )
+                      AND NOT EXISTS (
+                           SELECT 1 FROM delivery_status y
+                           WHERE y.assigned_user_id = pf."userId"
+                             AND y."DeliveryStatus" IN ('Scheduling','Start')
+                      )
+                    ORDER BY pf.cost ASC
+                """, (now_minutes, now_minutes))
+                fleets = cur.fetchall()
 
-                assigned.append({
-                    "rq_id": req_id,
-                    "user_id": user_id,
-                    "fleet_id": fleet_id
-                })
+                if not fleets:
+                    return {"assigned": [], "count": 0}
 
-                print(f"[ASSIGNED] → Fleet {fleet_id} (User {user_id}) assigned to Patient RQ {req_id}")
+                # Build fleets-by-skill (cheapest first)
+                from collections import defaultdict, deque
+                fleets_by_skill = defaultdict(deque)
+                for f in fleets:
+                    fleets_by_skill[f["skill"]].append(f)
 
-                all_fleets.pop(i)  # Remove assigned fleet
-                break  # One task gets one fleet only
+                used_users = set()
+                patient_updates = []  # (user_id, fleet_id, rq_id)
 
-        conn.commit()
+                for req in requests:
+                    skill = req["skill"]
+                    dq = fleets_by_skill.get(skill)
+                    if not dq:
+                        continue
+                    # Get the cheapest available fleet whose user not used
+                    while dq:
+                        f = dq[0]
+                        if f["user_id"] in used_users:
+                            dq.popleft()
+                            continue
+                        # assign
+                        used_users.add(f["user_id"])
+                        patient_updates.append((f["user_id"], f["fleet_id"], req["id"]))
+                        assigned.append({
+                            "rq_id": req["id"],
+                            "user_id": f["user_id"],
+                            "fleet_id": f["fleet_id"]
+                        })
+                        dq.popleft()
+                        break
+
+                # Batch update
+                if patient_updates:
+                    extras.execute_batch(
+                        cur,
+                        """
+                        UPDATE patient_rq
+                           SET assigned_user_id = %s,
+                               assigned_fleet_id = %s,
+                               status = 'Scheduling'
+                         WHERE id = %s
+                        """,
+                        patient_updates,
+                        page_size=200
+                    )
+            # conn commits automatically because of context manager
         return {"assigned": assigned, "count": len(assigned)}
-
     except Exception as e:
-        print(f"[ERROR] {e}")
         return {"error": str(e)}
 
-    finally:
-        cur.close()
-        conn.close()
-
-
-# Assign material transport tasks
+# -----------------------
+# Material assignment 
+# -----------------------
 @api.post("/assign-material")
 def assign_material(request):
-    conn = psycopg2.connect(
-        dbname="postgres",
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        host=os.environ["DB_HOST"],
-        port="5432"
-    )
-    cur = conn.cursor()
-
-    # Build inventory mapping: item → category
-    cur.execute('SELECT "Item", "Category" FROM "Inventory"')
-    inventory_map = dict(cur.fetchall())
-
-    # Fetch pending material delivery requests
-    cur.execute("""
-        SELECT id, "Item", "RequestTime"
-        FROM delivery_status
-        WHERE "DeliveryStatus" = 'Pending'
-    """)
-    pending_tasks = cur.fetchall()
-
-    # Fetch all fleet (ordered by cost)
-    cur.execute("""
-        SELECT id, "userId", type, cost, s_start, s_end
-        FROM patient_fleet
-        ORDER BY cost ASC
-    """)
-    all_fleets = cur.fetchall()
-
     assigned = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.DictCursor) as cur:
+                # Pending material tasks with computed request_min 
+                cur.execute("""
+                    SELECT d.id,
+                           d."Item",
+                           -- parse 'DD/MM/YYYY, HH24:MI:SS' to timestamp then to minutes
+                           EXTRACT(HOUR FROM to_timestamp(d."RequestTime",'DD/MM/YYYY, HH24:MI:SS'))*60
+                           + EXTRACT(MINUTE FROM to_timestamp(d."RequestTime",'DD/MM/YYYY, HH24:MI:SS')) AS request_min
+                    FROM delivery_status d
+                    WHERE d."DeliveryStatus" = 'Pending'
+                    ORDER BY d.id
+                """)
+                pending = cur.fetchall()
+                if not pending:
+                    return {"assigned": [], "count": 0}
 
-    for delivery_id, item_name, request_time_str in pending_tasks:
-        category = inventory_map.get(item_name)
-        required_type = 2 if category == "Laundry" else 1
+                # Map item -> category
+                cur.execute('SELECT "Item","Category" FROM "Inventory"')
+                inv_map = dict(cur.fetchall())
 
-        try:
-            dt = datetime.strptime(request_time_str, "%d/%m/%Y, %H:%M:%S")
-            request_min = dt.hour * 60 + dt.minute
-        except:
-            continue
+                # Needed types for all pending (1 default, 2 for Laundry)
+                # We’ll load fleets that can serve any of the required types and that are free
+                required_types = set()
+                for row in pending:
+                    cat = inv_map.get(row["Item"])
+                    required_types.add(2 if cat == "Laundry" else 1)
 
-        for i, (fleet_id, user_id, f_type, cost, s_start, s_end) in enumerate(all_fleets):
-            if int(f_type) != required_type or s_start is None or s_end is None:
-                continue
-            if not (s_start <= request_min <= s_end):
-                continue
+                if not required_types:
+                    return {"assigned": [], "count": 0}
 
-            # Ensure user is not already assigned
-            cur.execute("""
-                SELECT 1 FROM patient_rq WHERE assigned_user_id = %s AND status IN ('Scheduling', 'Start')
-                UNION
-                SELECT 1 FROM delivery_status WHERE assigned_user_id = %s AND "DeliveryStatus" IN ('Scheduling', 'Start')
-            """, (user_id, user_id))
-            if cur.fetchone():
-                continue
+                # Fleets by type, available at the specific request minute is trickier;
+                # we filter only by "free" here, then we check time per assignment quickly.
+                cur.execute(f"""
+                    SELECT pf.id AS fleet_id,
+                           pf."userId" AS user_id,
+                           pf.type,
+                           pf.cost,
+                           pf.s_start,
+                           pf.s_end
+                    FROM patient_fleet pf
+                    WHERE pf.type = ANY(%s)
+                      AND pf.s_start IS NOT NULL
+                      AND pf.s_end   IS NOT NULL
+                      AND NOT EXISTS (
+                           SELECT 1 FROM patient_rq x
+                           WHERE x.assigned_user_id = pf."userId"
+                             AND x.status IN ('Scheduling','Start')
+                      )
+                      AND NOT EXISTS (
+                           SELECT 1 FROM delivery_status y
+                           WHERE y.assigned_user_id = pf."userId"
+                             AND y."DeliveryStatus" IN ('Scheduling','Start')
+                      )
+                    ORDER BY pf.cost ASC
+                """, (list(required_types),))
+                fleets = cur.fetchall()
+                if not fleets:
+                    return {"assigned": [], "count": 0}
 
-            # ✔ Assign material request
-            cur.execute("""
-                UPDATE delivery_status
-                SET assigned_user_id = %s,
-                    assigned_fleet_id = %s,
-                    "DeliveryStatus" = 'Scheduling'
-                WHERE id = %s
-            """, (user_id, fleet_id, delivery_id))
+                # Group fleets by type (cheapest first)
+                from collections import defaultdict, deque
+                fleets_by_type = defaultdict(deque)
+                for f in fleets:
+                    fleets_by_type[int(f["type"])].append(f)
 
-            assigned.append({
-                "delivery_id": delivery_id,
-                "item": item_name,
-                "category": category,
-                "fleet_id": fleet_id,
-                "user_id": user_id,
-                "minute": request_min
-            })
-            all_fleets.pop(i)
-            break
+                used_users = set()
+                material_updates = []  # (user_id, fleet_id, delivery_id)
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"assigned": assigned, "count": len(assigned)}
+                for row in pending:
+                    item = row["Item"]
+                    req_min = int(row["request_min"] or 0)
+                    cat = inv_map.get(item)
+                    rtype = 2 if cat == "Laundry" else 1
+                    dq = fleets_by_type.get(rtype)
+                    if not dq:
+                        continue
 
+                    # pick the cheapest fleet that is working at request minute & user not used
+                    while dq:
+                        f = dq[0]
+                        if (f["user_id"] in used_users) or not (f["s_start"] <= req_min <= f["s_end"]):
+                            dq.popleft()
+                            continue
+                        used_users.add(f["user_id"])
+                        material_updates.append((f["user_id"], f["fleet_id"], row["id"]))
+                        assigned.append({
+                            "delivery_id": row["id"],
+                            "item": item,
+                            "category": cat,
+                            "fleet_id": f["fleet_id"],
+                            "user_id": f["user_id"],
+                            "minute": req_min
+                        })
+                        dq.popleft()
+                        break
 
-# Assign both patient and material tasks
+                # Batch update
+                if material_updates:
+                    extras.execute_batch(
+                        cur,
+                        """
+                        UPDATE delivery_status
+                           SET assigned_user_id = %s,
+                               assigned_fleet_id = %s,
+                               "DeliveryStatus" = 'Scheduling'
+                         WHERE id = %s
+                        """,
+                        material_updates,
+                        page_size=200
+                    )
+        return {"assigned": assigned, "count": len(assigned)}
+    except Exception as e:
+        return {"error": str(e)}
+
+# -----------------------
+# Assign both
+# -----------------------
 @api.post("/assign-all")
 def assign_all(request):
-    result1 = assign_patient(request)
-    result2 = assign_material(request)
-    return {
-        "patient": result1,
-        "material": result2,
-        "total_assigned": result1["count"] + result2["count"]
-    }
+    p = assign_patient(request)
+    m = assign_material(request)
+
+    pc = p.get("count", 0) if isinstance(p, dict) else 0
+    mc = m.get("count", 0) if isinstance(m, dict) else 0
+    return {"patient": p, "material": m, "total_assigned": pc + mc}
