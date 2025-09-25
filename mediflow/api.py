@@ -1,8 +1,10 @@
 from ninja import NinjaAPI
 import os
 import psycopg2
-import psycopg2.extras as extras
+from dotenv import load_dotenv
 from datetime import datetime
+
+load_dotenv()
 
 api = NinjaAPI()
 
